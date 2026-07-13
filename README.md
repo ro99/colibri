@@ -203,24 +203,23 @@ completion requests support JSON responses, SSE streaming, usage counts,
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
-The first version is deliberately text-only and serves one generation at a time:
-the 744B model stays in one persistent process, so concurrent HTTP requests queue
-instead of loading duplicate model copies. Tools, image/audio input, custom stop
-sequences, log probabilities, and token penalties return an explicit error rather
-than being silently ignored. The default bind address is localhost; set
+The server is deliberately text-only and keeps the 744B model in one persistent
+process. With more than one KV slot, active requests decode together as a continuous
+batch (one row per request); prompt prefill remains serial. Tools, image/audio input,
+custom stop sequences, log probabilities, and token penalties return an explicit
+error rather than being silently ignored. The default bind address is localhost; set
 `COLI_API_KEY` before exposing the server beyond the machine.
 
 Browser access from the Vite development server and Tauri local origins is enabled
 by default. Repeat `--cors-origin https://your-ui.example` to allow another exact
 origin, or use `--cors-origin '*'` only on a trusted local network.
 
-The engine owns one mutable KV context, so HTTP generation uses a bounded FIFO
-admission queue instead of pretending to run unsafe parallel sequences. Configure it
-with `--max-queue N` (default 8) and `--queue-timeout SECONDS` (default 300), or the
-`COLI_MAX_QUEUE` / `COLI_QUEUE_TIMEOUT` environment variables. Saturated and timed-out
-requests receive OpenAI-shaped HTTP 429 errors before streaming headers are sent.
-`GET /health` exposes active/queued/completed/rejected counters, and successful
-generation responses include `x-colibri-queue-wait-ms`.
+HTTP generation uses a bounded FIFO admission queue with one active request per KV
+slot. Configure it with `--max-queue N` (default 8) and `--queue-timeout SECONDS`
+(default 300), or the `COLI_MAX_QUEUE` / `COLI_QUEUE_TIMEOUT` environment variables.
+Saturated and timed-out requests receive OpenAI-shaped HTTP 429 errors before
+streaming headers are sent. `GET /health` exposes active/queued/completed/rejected
+counters, and successful generation responses include `x-colibri-queue-wait-ms`.
 
 ### Isolated KV contexts
 
@@ -237,11 +236,11 @@ it and keep the original slot 0 behavior.
 ```
 
 Each slot owns its token history, compressed MLA/DSA KV memory, MTP window, and
-crash-safe persistence file (`.coli_kv`, `.coli_kv.1`, ...). The engine still executes
-one sequence at a time; this establishes explicit KV ownership without pretending that
-threaded HTTP is continuous batching. RAM admission accounts for every configured slot.
-Use `COLI_KV_SLOTS=N` as the environment equivalent. Start with a small value: at the
-default 4096-token context, every slot costs hundreds of MB.
+crash-safe persistence file (`.coli_kv`, `.coli_kv.1`, ...). At decode, every occupied
+slot contributes one row to the same MoE forward; this is the route to useful CUDA
+batch sizes. RAM admission accounts for every configured slot. Use `COLI_KV_SLOTS=N`
+as the environment equivalent. Start with a small value: at the default 4096-token
+context, every slot costs hundreds of MB.
 
 ### Experimental Metal backend (Apple Silicon)
 
@@ -270,10 +269,11 @@ path falls back to the CPU per-block on any fault. Numerics are dequant→f32-MA
 
 ### Experimental resident CUDA backend
 
-colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
-experts deliberately remain on the original CPU path for now: copying an expert
-from NVMe to the GPU on every use would only replace the disk bottleneck with a
-PCIe bottleneck. Resident quantized tensors are uploaded lazily once and reused.
+colibrì includes an opt-in CUDA backend for model-resident tensors. The default keeps
+streaming experts on the CPU. `COLI_CUDA_STREAM_EXPERTS=1` is an experimental compact
+grouped path that stages RAM experts on the GPU; without a cache this can be PCIe-bound.
+`CUDA_EXPERT_CACHE_GB` retains recently streamed experts in a bounded VRAM LRU so a
+repeat route uses the normal resident grouped launch instead of re-uploading weights.
 
 ```bash
 cd c
@@ -308,6 +308,10 @@ PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
 CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# Reserve 8 GB of the 58 GB expert budget for RAM-expert reuse on a 3-GPU box.
+COLI_CUDA=1 COLI_GPUS=0,1,2 CUDA_EXPERT_GB=58 CUDA_EXPERT_CACHE_GB=8 \
+COLI_CUDA_STREAM_EXPERTS=1 CUDA_DENSE=1 PIN=stats.txt PIN_GB=180 RAM_GB=200 \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -331,6 +335,13 @@ down automatically (54 to 40 in that run) so the larger pinned tier does not exc
 the process budget. Start lower on hosts with less available RAM.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
+
+`CUDA_EXPERT_CACHE_GB` is part of `CUDA_EXPERT_GB`, not additional capacity: the
+startup-ranked hot tier receives the remainder, so the cache cannot overcommit the
+runtime reserve. It requires `COLI_CUDA_STREAM_EXPERTS=1` and compact grouped experts
+(the default). The first route to a cache miss still uploads its weights; inspect the
+`[CUDA] streamed-expert cache` line and grouped H2D totals to decide whether its
+recency benefit outweighs that initial transfer on your workload.
 
 On six RTX 5090 32 GB cards with GLM-5.2 int4, a 150 GB hot-first tier sustained
 0.94 token/s over a 64-token varied prompt (87.8% expert hit rate), and reached

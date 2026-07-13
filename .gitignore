@@ -49,3 +49,8 @@ c/backend_metal_test
 c/tests/test_tier
 c/mio_env/
 c/bench/
+INSTRUCTIONS.md
+.gitignore
+AGENT_BRIEF_MULTIGPU.md
+docs/multi_gpu_acceleration_plan.md
+c/glm52/
