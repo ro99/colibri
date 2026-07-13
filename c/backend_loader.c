@@ -34,12 +34,41 @@ typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
-                                         double *h2d_ms, double *kernel_ms, double *d2h_ms);
+                                         double *h2d_ms, double *kernel_ms, double *d2h_ms,
+                                         uint64_t *h2d_bytes, uint64_t *d2h_bytes);
+typedef void           (*fn_cache_stats)(uint64_t *fills, uint64_t *h2d_bytes, double *h2d_ms);
 typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up,
                                         ColiCudaTensor *down, float *y, const float *x, int S);
+typedef int            (*fn_expert_cache_fill)(ColiCudaTensor *gate, ColiCudaTensor *up,
+                                               ColiCudaTensor *down,
+                                               const void *gate_weights, const void *up_weights,
+                                               const void *down_weights,
+                                               const float *gate_scales, const float *up_scales,
+                                               const float *down_scales);
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
                                           float *y, const float *x);
+typedef int            (*fn_expert_group_accum)(ColiCudaTensor *const *gates,
+                                                ColiCudaTensor *const *ups,
+                                                ColiCudaTensor *const *downs,
+                                                const int *rows, int count,
+                                                float *out, const float *x,
+                                                int S, const int *row_ids,
+                                                const float *row_weights);
+typedef int            (*fn_expert_group_host_accum)(const void *const *gates,
+                                                     const void *const *ups,
+                                                     const void *const *downs,
+                                                     const float *const *gate_scales,
+                                                     const float *const *up_scales,
+                                                     const float *const *down_scales,
+                                                     const int *gate_fmts,
+                                                     const int *up_fmts,
+                                                     const int *down_fmts,
+                                                     const int *rows, int count,
+                                                     float *out, const float *x,
+                                                     int S, const int *row_ids,
+                                                     const float *row_weights,
+                                                     int D, int I, int device);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
                                               int R, int V, int K, int T, float attention_scale);
@@ -64,8 +93,12 @@ static struct {
     fn_mem_info        mem_info;
     fn_stats           stats;
     fn_group_stats     group_stats;
+    fn_cache_stats     cache_stats;
     fn_expert_mlp      expert_mlp;
+    fn_expert_cache_fill expert_cache_fill;
     fn_expert_group    expert_group;
+    fn_expert_group_accum expert_group_accum;
+    fn_expert_group_host_accum expert_group_host_accum;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_matmul          matmul;
@@ -74,7 +107,7 @@ static struct {
     fn_tensor_device   tensor_device;
 } g_cuda;
 
-/* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
+/* Resolve the DLL and every required symbol. Returns 1 on success, 0 otherwise.
  * Idempotent: the first call (success or fail) sticks; later calls are no-ops
  * that return the cached result. The engine treats a 0 return as "CUDA
  * unavailable" and falls back to the CPU path without aborting. */
@@ -111,8 +144,12 @@ static int coli_cuda_load(void){
     RESOLVE(mem_info,       fn_mem_info)
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
+    RESOLVE(cache_stats,    fn_cache_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
+    RESOLVE(expert_cache_fill, fn_expert_cache_fill)
     RESOLVE(expert_group,   fn_expert_group)
+    RESOLVE(expert_group_accum, fn_expert_group_accum)
+    RESOLVE(expert_group_host_accum, fn_expert_group_host_accum)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(matmul,         fn_matmul)
@@ -160,13 +197,31 @@ void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes){
 }
 
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
-                           double *h2d_ms, double *kernel_ms, double *d2h_ms){
+                           double *h2d_ms, double *kernel_ms, double *d2h_ms,
+                           uint64_t *h2d_bytes, uint64_t *d2h_bytes){
     if(!g_cuda.available){
-        if(calls)*calls=0; if(experts)*experts=0; if(rows)*rows=0;
-        if(h2d_ms)*h2d_ms=0; if(kernel_ms)*kernel_ms=0; if(d2h_ms)*d2h_ms=0;
+        if(calls) *calls=0;
+        if(experts) *experts=0;
+        if(rows) *rows=0;
+        if(h2d_ms) *h2d_ms=0;
+        if(kernel_ms) *kernel_ms=0;
+        if(d2h_ms) *d2h_ms=0;
+        if(h2d_bytes) *h2d_bytes=0;
+        if(d2h_bytes) *d2h_bytes=0;
         return;
     }
-    g_cuda.group_stats(calls, experts, rows, h2d_ms, kernel_ms, d2h_ms);
+    g_cuda.group_stats(calls, experts, rows, h2d_ms, kernel_ms, d2h_ms,
+                       h2d_bytes, d2h_bytes);
+}
+
+void coli_cuda_cache_stats(uint64_t *fills, uint64_t *h2d_bytes, double *h2d_ms){
+    if(!g_cuda.available){
+        if(fills) *fills=0;
+        if(h2d_bytes) *h2d_bytes=0;
+        if(h2d_ms) *h2d_ms=0;
+        return;
+    }
+    g_cuda.cache_stats(fills, h2d_bytes, h2d_ms);
 }
 
 int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
@@ -175,11 +230,57 @@ int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     return g_cuda.expert_mlp(gate, up, down, y, x, S);
 }
 
+int coli_cuda_expert_cache_fill(ColiCudaTensor *gate, ColiCudaTensor *up,
+                                ColiCudaTensor *down,
+                                const void *gate_weights, const void *up_weights,
+                                const void *down_weights,
+                                const float *gate_scales, const float *up_scales,
+                                const float *down_scales){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_cache_fill(gate, up, down,
+                                    gate_weights, up_weights, down_weights,
+                                    gate_scales, up_scales, down_scales);
+}
+
 int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                            ColiCudaTensor *const *downs, const int *rows, int count,
                            float *y, const float *x){
     if(!g_cuda.available) return 0;
     return g_cuda.expert_group(gates, ups, downs, rows, count, y, x);
+}
+
+int coli_cuda_expert_group_accum(ColiCudaTensor *const *gates,
+                                 ColiCudaTensor *const *ups,
+                                 ColiCudaTensor *const *downs,
+                                 const int *rows, int count,
+                                 float *out, const float *x,
+                                 int S, const int *row_ids,
+                                 const float *row_weights){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_group_accum(gates, ups, downs, rows, count,
+                                     out, x, S, row_ids, row_weights);
+}
+
+int coli_cuda_expert_group_host_accum(const void *const *gates,
+                                      const void *const *ups,
+                                      const void *const *downs,
+                                      const float *const *gate_scales,
+                                      const float *const *up_scales,
+                                      const float *const *down_scales,
+                                      const int *gate_fmts,
+                                      const int *up_fmts,
+                                      const int *down_fmts,
+                                      const int *rows, int count,
+                                      float *out, const float *x,
+                                      int S, const int *row_ids,
+                                      const float *row_weights,
+                                      int D, int I, int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_group_host_accum(gates, ups, downs,
+                                          gate_scales, up_scales, down_scales,
+                                          gate_fmts, up_fmts, down_fmts,
+                                          rows, count, out, x, S,
+                                          row_ids, row_weights, D, I, device);
 }
 
 int coli_cuda_attention_absorb(ColiCudaTensor *kv_b, float *ctx, const float *q,

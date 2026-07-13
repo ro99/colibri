@@ -32,7 +32,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
-                           double *h2d_ms, double *kernel_ms, double *d2h_ms);
+                                               double *h2d_ms, double *kernel_ms, double *d2h_ms,
+                                               uint64_t *h2d_bytes, uint64_t *d2h_bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_cache_stats(uint64_t *fills, uint64_t *h2d_bytes,
+                                               double *h2d_ms);
 
 /* Upload without executing, so capacity failures happen during model startup. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
@@ -56,6 +59,17 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Overwrite an existing resident expert triple in place. The destination
+ * tensors keep their device allocations; only the weight bytes and per-row
+ * scales are refreshed on that device's stream. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_cache_fill(ColiCudaTensor *gate, ColiCudaTensor *up,
+                                                    ColiCudaTensor *down,
+                                                    const void *gate_weights, const void *up_weights,
+                                                    const void *down_weights,
+                                                    const float *gate_scales,
+                                                    const float *up_scales,
+                                                    const float *down_scales);
+
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
@@ -63,6 +77,36 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *downs,
                            const int *rows, int count,
                            float *y, const float *x);
+
+/* Compact grouped-expert path. x/out are [S,D]. row_ids and row_weights contain
+ * sum(rows) entries in call order, mapping each routed expert row back to the
+ * source/output row. Outputs are accumulated on device before one D2H copy. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_accum(ColiCudaTensor *const *gates,
+                                                     ColiCudaTensor *const *ups,
+                                                     ColiCudaTensor *const *downs,
+                                                     const int *rows, int count,
+                                                     float *out, const float *x,
+                                                     int S, const int *row_ids,
+                                                     const float *row_weights);
+
+/* Transient counterpart for RAM-resident experts. The packed weights and
+ * scales are staged into reusable device scratch, used by one grouped MLP,
+ * and are not retained in the resident tensor set. This lets RAM act as the
+ * expert backing store while CUDA remains the compute tier. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_host_accum(const void *const *gates,
+                                                          const void *const *ups,
+                                                          const void *const *downs,
+                                                          const float *const *gate_scales,
+                                                          const float *const *up_scales,
+                                                          const float *const *down_scales,
+                                                          const int *gate_fmts,
+                                                          const int *up_fmts,
+                                                          const int *down_fmts,
+                                                          const int *rows, int count,
+                                                          float *out, const float *x,
+                                                          int S, const int *row_ids,
+                                                          const float *row_weights,
+                                                          int D, int I, int device);
 
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,

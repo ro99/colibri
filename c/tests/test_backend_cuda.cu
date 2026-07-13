@@ -77,10 +77,34 @@ int main(int argc, char **argv) {
     }
     if (!coli_cuda_expert_mlp(tg,tu,td,expert,x,2) ||
         !close_enough(expert,want_expert,8)) return 1;
+    const float ed_alt[8] = {2,0, 0,2, 0,0, 1,1};
+    float want_alt[8];
+    for(int s=0;s<2;s++){
+        float a=want_expert[s*4], b=want_expert[s*4+1];
+        want_alt[s*4]=2*a; want_alt[s*4+1]=2*b;
+        want_alt[s*4+2]=0; want_alt[s*4+3]=a+b;
+    }
+    if(!coli_cuda_expert_cache_fill(tg,tu,td,eg,eu,ed_alt,nullptr,nullptr,nullptr) ||
+       !coli_cuda_expert_mlp(tg,tu,td,expert,x,2) ||
+       !close_enough(expert,want_alt,8)) return 1;
+    if(!coli_cuda_expert_cache_fill(tg,tu,td,eg,eu,ed,nullptr,nullptr,nullptr) ||
+       !coli_cuda_expert_mlp(tg,tu,td,expert,x,2) ||
+       !close_enough(expert,want_expert,8)) return 1;
     ColiCudaTensor *gates[2]={tg,tg},*ups[2]={tu,tu},*downs[2]={td,td};
     int group_rows[2]={1,1}; float grouped[8];
     if (!coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,x) ||
         !close_enough(grouped,want_expert,8)) return 1;
+    const int packed_rows[2]={0,1};
+    const float packed_weights[2]={1.0f,1.0f};
+    float compact_grouped[8];
+    if(!coli_cuda_expert_group_accum(gates,ups,downs,group_rows,2,compact_grouped,x,2,packed_rows,packed_weights) ||
+       !close_enough(compact_grouped,want_expert,8)) return 1;
+    const int reuse_rows[2]={0,0};
+    const float reuse_weights[2]={0.25f,0.75f};
+    float reused[8]={0};
+    if(!coli_cuda_expert_group_accum(gates,ups,downs,group_rows,2,reused,x,2,reuse_rows,reuse_weights)) return 1;
+    if(!close_enough(reused,want_expert,4)) return 1;
+    for(int i=4;i<8;i++) if(std::fabs(reused[i])>1e-6f) return 1;
 
     const float aw[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     const float aq[4]={1,2,.5f,-.5f},al[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};
@@ -109,6 +133,12 @@ int main(int argc, char **argv) {
        !coli_cuda_tensor_upload(&d4,w4,ws4,2,32,32,d0))return 1;
     ColiCudaTensor *gg4[2]={g4,g4},*ug4[2]={u4,u4},*dg4[2]={d4,d4};
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,scalar4,gx4))return 1;
+    const void *hg4[2]={w4,w4},*hu4[2]={w4,w4},*hd4[2]={w4,w4};
+    const float *hgs4[2]={ws4,ws4},*hus4[2]={ws4,ws4},*hds4[2]={ws4,ws4};
+    const int hfmt4[2]={2,2}; float streamed4[64];
+    if(!coli_cuda_expert_group_host_accum(hg4,hu4,hd4,hgs4,hus4,hds4,
+        hfmt4,hfmt4,hfmt4,group_rows,2,streamed4,gx4,2,packed_rows,packed_weights,32,32,d0)||
+       !close_enough(streamed4,scalar4,64))return 1;
     setenv("COLI_CUDA_TC_INT4","1",1);
     setenv("COLI_CUDA_TC_MIN_ROWS","1",1);
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,tensor4,gx4)||
@@ -116,9 +146,12 @@ int main(int argc, char **argv) {
     unsetenv("COLI_CUDA_TC_INT4");
     unsetenv("COLI_CUDA_TC_MIN_ROWS");
     coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
-    uint64_t group_calls=0,group_experts=0,group_total_rows=0;
-    coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    if(group_calls!=3||group_experts!=6||group_total_rows!=6) return 1;
+    uint64_t group_calls=0,group_experts=0,group_total_rows=0,h2d_bytes=0,d2h_bytes=0;
+    coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr,&h2d_bytes,&d2h_bytes);
+    if(group_calls!=6||group_experts!=12||group_total_rows!=12||!h2d_bytes||!d2h_bytes) return 1;
+    uint64_t cache_fills=0,cache_h2d_bytes=0; double cache_h2d_ms=0;
+    coli_cuda_cache_stats(&cache_fills,&cache_h2d_bytes,&cache_h2d_ms);
+    if(cache_fills!=2||!cache_h2d_bytes||cache_h2d_ms<0) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {

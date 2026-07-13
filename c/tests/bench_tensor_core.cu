@@ -19,6 +19,23 @@ static double run(ColiCudaTensor *g,ColiCudaTensor *u,ColiCudaTensor *d,
     return std::chrono::duration<double,std::milli>(end-begin).count()/iterations;
 }
 
+static double run_host(const void *g,const void *u,const void *d,
+                       const float *gs,const float *us,const float *ds,
+                       const float *x,float *y,int rows,int iterations,int D,int I,int device){
+    const void *ga[1]={g},*ua[1]={u},*da[1]={d};
+    const float *gsa[1]={gs},*usa[1]={us},*dsa[1]={ds};
+    int rs[1]={rows},fmt[1]={2},ids[8];float weights[8];
+    for(int r=0;r<rows;r++){ids[r]=r;weights[r]=1.f;}
+    unsetenv("COLI_CUDA_TC_INT4");
+    if(!coli_cuda_expert_group_host_accum(ga,ua,da,gsa,usa,dsa,fmt,fmt,fmt,
+        rs,1,y,x,rows,ids,weights,D,I,device))std::exit(2);
+    auto begin=std::chrono::steady_clock::now();
+    for(int n=0;n<iterations;n++)if(!coli_cuda_expert_group_host_accum(
+        ga,ua,da,gsa,usa,dsa,fmt,fmt,fmt,rs,1,y,x,rows,ids,weights,D,I,device))std::exit(2);
+    auto end=std::chrono::steady_clock::now();
+    return std::chrono::duration<double,std::milli>(end-begin).count()/iterations;
+}
+
 int main(){
     constexpr int D=6144,I=2048,O=8;
     int device=0;if(!coli_cuda_init(&device,1))return 77;
@@ -37,9 +54,11 @@ int main(){
         double scalar=run(g,u,d,x.data(),a.data(),rows,3,0);
         double packed=run(g,u,d,x.data(),b.data(),rows,3,1);
         double tc=run(g,u,d,x.data(),c.data(),rows,3,2);
+        double streamed=run_host(hidden.data(),hidden.data(),down.data(),hs.data(),hs.data(),ds.data(),
+                                 x.data(),c.data(),rows,10,D,I,device);
         double pe=0,te=0,ref=0;for(int i=0;i<rows*D;i++){double p=b[i]-a[i],t=c[i]-a[i];pe+=p*p;te+=t*t;ref+=(double)a[i]*a[i];}
-        std::printf("rows=%d scalar_ms=%.3f packed_ms=%.3f packed_speedup=%.3fx packed_rms=%.7f tensor_ms=%.3f tensor_speedup=%.3fx tensor_rms=%.5f\n",
-                    rows,scalar,packed,scalar/packed,std::sqrt(pe/(ref+1e-20)),tc,scalar/tc,std::sqrt(te/(ref+1e-20)));
+        std::printf("rows=%d scalar_ms=%.3f packed_ms=%.3f packed_speedup=%.3fx packed_rms=%.7f tensor_ms=%.3f tensor_speedup=%.3fx tensor_rms=%.5f streamed_ms=%.3f\n",
+                    rows,scalar,packed,scalar/packed,std::sqrt(pe/(ref+1e-20)),tc,scalar/tc,std::sqrt(te/(ref+1e-20)),streamed);
     }
     coli_cuda_tensor_free(g);coli_cuda_tensor_free(u);coli_cuda_tensor_free(d);coli_cuda_shutdown();
 }
