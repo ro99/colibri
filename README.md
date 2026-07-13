@@ -209,8 +209,9 @@ $env:COLI_CUDA="1"; $env:COLI_GPU="0"; $env:CUDA_EXPERT_GB="8"
 python coli chat --model D:\glm52_i4 --topp 0.7
 ```
 
-The DLL exports 11 `extern "C"` symbols (`coli_cuda_init`, `coli_cuda_matmul`,
-etc.); `backend_loader.c` resolves them via `GetProcAddress` on first use.
+The DLL exports the `extern "C"` CUDA API (`coli_cuda_init`, `coli_cuda_matmul`,
+etc.); `backend_loader.c` resolves every required symbol via `GetProcAddress` on
+first use.
 `ColiCudaTensor*` is opaque to the host (stored, never dereferenced), so the
 MSVC-allocated struct is safe across the ABI boundary. `CUDA_ARCH` must match
 your GPU's compute capability (e.g. `sm_120` for Blackwell / RTX 50-series,
@@ -316,10 +317,11 @@ path falls back to the CPU per-block on any fault. Numerics are dequant→f32-MA
 
 ### Experimental resident CUDA backend
 
-colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
-experts deliberately remain on the original CPU path for now: copying an expert
-from NVMe to the GPU on every use would only replace the disk bottleneck with a
-PCIe bottleneck. Resident quantized tensors are uploaded lazily once and reused.
+colibrì includes an opt-in CUDA backend for model-resident tensors. The default keeps
+streaming experts on the CPU. `COLI_CUDA_STREAM_EXPERTS=1` is an experimental compact
+grouped path that stages RAM experts on the GPU; without a cache this can be PCIe-bound.
+`CUDA_EXPERT_CACHE_GB` retains recently streamed experts in a bounded VRAM LRU so a
+repeat route uses the normal resident grouped launch instead of re-uploading weights.
 
 ```bash
 cd c
@@ -354,6 +356,10 @@ PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
 CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# Reserve 8 GB of the 58 GB expert budget for RAM-expert reuse on a 3-GPU box.
+COLI_CUDA=1 COLI_GPUS=0,1,2 CUDA_EXPERT_GB=58 CUDA_EXPERT_CACHE_GB=8 \
+COLI_CUDA_STREAM_EXPERTS=1 CUDA_DENSE=1 PIN=stats.txt PIN_GB=180 RAM_GB=200 \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -377,6 +383,13 @@ down automatically (54 to 40 in that run) so the larger pinned tier does not exc
 the process budget. Start lower on hosts with less available RAM.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
+
+`CUDA_EXPERT_CACHE_GB` is part of `CUDA_EXPERT_GB`, not additional capacity: the
+startup-ranked hot tier receives the remainder, so the cache cannot overcommit the
+runtime reserve. It requires `COLI_CUDA_STREAM_EXPERTS=1` and compact grouped experts
+(the default). The first route to a cache miss still uploads its weights; inspect the
+`[CUDA] streamed-expert cache` line and grouped H2D totals to decide whether its
+recency benefit outweighs that initial transfer on your workload.
 
 On six RTX 5090 32 GB cards with GLM-5.2 int4, a 150 GB hot-first tier sustained
 0.94 token/s over a 64-token varied prompt (87.8% expert hit rate), and reached
