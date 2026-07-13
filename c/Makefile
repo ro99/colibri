@@ -91,6 +91,9 @@ NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
+ifneq ($(UNAME_S),Darwin)
+TEST_BINS += tests/test_cuda_cache_owner$(EXE)
+endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -203,6 +206,12 @@ tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h c
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Metadata-only regression for the streamed-expert cache.  It includes the real
+# glm.c helpers with CUDA types enabled, then lets the linker discard every
+# unrelated engine section, so it needs neither a CUDA runtime nor a model.
+tests/test_cuda_cache_owner$(EXE): tests/test_cuda_cache_owner.c glm.c backend_cuda.h st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA -ffunction-sections -fdata-sections $< -o $@ $(LDFLAGS) -Wl,--gc-sections
 
 test-c: $(TEST_BINS)
 	@for test in $(TEST_BINS); do ./$$test || exit 1; done

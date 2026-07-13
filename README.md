@@ -417,6 +417,17 @@ The fixture has random weights and is not a language model. It exists only to
 preserve the real MLA/MoE/streaming shapes and compare CPU streaming, dense-only
 CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
 
+For a real-model A/B, capture exact greedy token IDs once, then reuse the file:
+
+```bash
+PROMPT='your fixed prompt' NGEN=192 TEMP=0 DRAFT=0 \
+  REPLAY_OUT=replay.json SNAP=/nvme/glm52_i4 ./glm 64 4 4
+REF=replay.json REPLAY=1 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+```
+
+Capture ignores stop tokens so the continuation is exactly `NGEN` tokens and
+refuses to overwrite an existing fixture.
+
 ### Web interface
 
 `web/` contains a community-contributed browser UI (React + TypeScript, ~390
