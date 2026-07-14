@@ -27,7 +27,9 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
-#include <sys/select.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
+#endif
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -122,20 +124,25 @@ typedef struct {
  * VISTE dentro `slab` (una sola pread coalescente); nel fallback hanno buffer propri.
  * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
+#ifdef COLI_CUDA
+typedef struct CudaCacheSlot CudaCacheSlot;
+#endif
+
 typedef struct ESlot { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used;
 #ifdef COLI_CUDA
                  int cuda_cache; int64_t cuda_cache_bytes; uint64_t cuda_cache_used;
+                 CudaCacheSlot *cuda_cache_slot;
 #endif
 } ESlot;
 
 #ifdef COLI_CUDA
-typedef struct {
+struct CudaCacheSlot {
     ColiCudaTensor *g, *u, *d;
     ESlot *owner;
     int device;
     int64_t bytes;
-} CudaCacheSlot;
+};
 
 typedef struct {
     CudaCacheSlot *slot;
@@ -525,6 +532,8 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
  * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
 #define IDOT_KERNEL "avx512-vnni"
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+#define IDOT_KERNEL "avx-vnni"
 #elif defined(__AVX2__)
 #define IDOT_KERNEL "avx2"
 #elif defined(__ARM_NEON)
@@ -561,6 +570,12 @@ static inline int hsum256_i32(__m256i v){
     return _mm_cvtsi128_si32(lo);
 }
 #endif
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+/* hsum di un __m128i a 4 lane s32 (l'AVX-VNNI 128-bit accumula su 4 lane). */
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
+}
+#endif
 /* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
  * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
 static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
@@ -579,6 +594,18 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
         acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
     }
     sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit: vpdpbusd u8*s8 -> s32, 16 byte/iter. Stesso trucco del
+     * segno della variante 512-bit: |w| via abs, segno piegato in x con maschera
+     * (w==0 -> product 0). __AVX2__ serve per _mm_sign_epi8 / abs. */
+    __m128i acc=_mm_setzero_si128();
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i xs=_mm_sign_epi8(xv,wv);              /* x * sign(w); _mm_sign zona __AVX2__ */
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__AVX2__)
     __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
     for(;i+32<=I;i+=32){
@@ -649,6 +676,23 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
     }
     sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit, int4: 16 byte = 32 nibble -> int8 [-8,7] in due half
+     * (n0/n1), ciascuno alimentato a un vpdpbusd da 16 byte. Stesso unpack
+     * 128-bit del ramo AVX2 sotto; 32 elementi/iter come li. */
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* nibble in ordine */
+        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__AVX2__)
     const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
     const __m256i ones=_mm256_set1_epi16(1);
@@ -1227,7 +1271,9 @@ static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
     for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
-    void *base=NULL; struct stat st;
+    void *base=NULL;
+#if defined(__APPLE__) || defined(__linux__)
+    struct stat st;
     if(g_nmaps<512 && fstat(fd,&st)==0){
         size_t len=((size_t)st.st_size+16383)&~(size_t)16383;
         void *p=mmap(NULL,len,PROT_READ,MAP_SHARED,fd,0);
@@ -1238,12 +1284,13 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#endif
     pthread_mutex_unlock(&g_map_mtx);
     return base;
 }
 
 #ifdef COLI_CUDA
-static void cuda_cache_drop(Model *m, ESlot *s);
+static int cuda_cache_drop(Model *m, ESlot *s);
 #endif
 
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
@@ -1305,7 +1352,9 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
              * residency. This is pread's I/O without the copy and without the slab. */
             for(int k=0;k<3;k++){
                 char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
+#if defined(__APPLE__) || defined(__linux__)
                 madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
+#endif
                 volatile char acc=0;
                 for(size_t i=0;i<n;i+=4096) acc+=p[i];
                 acc+=p[n-1]; (void)acc;
@@ -1531,51 +1580,46 @@ static int cuda_cache_device_index(int device){
     return -1;
 }
 
-static CudaCacheSlot *cuda_cache_slot_of(Model *m, ESlot *owner){
-    if(!m||!owner) return NULL;
-    for(int i=0;i<g_cuda_ndev;i++){
-        CudaCacheArena *arena=&m->cuda_cache_arena[i];
-        for(int j=0;j<arena->nslot;j++) if(arena->slot[j].owner==owner) return &arena->slot[j];
-    }
-    return NULL;
-}
-
 static CudaCacheSlot *cuda_cache_slot_for_entry(Model *m, ESlot *s){
-    if(!m||!s||!s->cuda_cache) return NULL;
-    CudaCacheSlot *slot=cuda_cache_slot_of(m,s);
-    if(slot) return slot;
-    for(int i=0;i<g_cuda_ndev;i++){
-        CudaCacheArena *arena=&m->cuda_cache_arena[i];
-        for(int j=0;j<arena->nslot;j++){
-            CudaCacheSlot *cand=&arena->slot[j];
-            if(cand->g==s->g.cuda && cand->u==s->u.cuda && cand->d==s->d.cuda){
-                cand->owner=s;
-                return cand;
-            }
-        }
-    }
-    return NULL;
-}
-
-static void cuda_cache_rebind(Model *m, ESlot *from, ESlot *to){
     CudaCacheSlot *slot;
-    if(!m||!from||!to||from==to) return;
-    slot=cuda_cache_slot_of(m,from);
-    if(slot) slot->owner=to;
+    if(!m||!s||!s->cuda_cache) return NULL;
+    slot=s->cuda_cache_slot;
+    if(!slot || slot->owner!=s || slot->g!=s->g.cuda || slot->u!=s->u.cuda ||
+       slot->d!=s->d.cuda || slot->bytes!=s->cuda_cache_bytes ||
+       slot->device!=s->g.cuda_device || slot->device!=s->u.cuda_device ||
+       slot->device!=s->d.cuda_device) return NULL;
+    return slot;
 }
 
-static void cuda_cache_bind(Model *m, ESlot *s, CudaCacheSlot *slot){
+/* ESlot is moved with a struct swap when ws[] is promoted into the per-layer
+ * LRU.  The destination carries the slot back-pointer after the swap, while
+ * the slot still names the old ws[] address.  Update that one edge explicitly;
+ * never recover ownership by matching tensor handles, because a stale copied
+ * ESlot has the same handles as the slot's real owner. */
+static int cuda_cache_rebind(Model *m, ESlot *from, ESlot *to){
+    CudaCacheSlot *slot;
+    if(!m||!from||!to||from==to||!to->cuda_cache) return 0;
+    slot=to->cuda_cache_slot;
+    if(!slot || slot->owner!=from || slot->g!=to->g.cuda || slot->u!=to->u.cuda ||
+       slot->d!=to->d.cuda || slot->bytes!=to->cuda_cache_bytes) return 0;
+    slot->owner=to;
+    return 1;
+}
+
+static int cuda_cache_bind(Model *m, ESlot *s, CudaCacheSlot *slot){
     int di;
-    if(!m||!s||!slot) return;
+    if(!m||!s||!slot || slot->owner || s->cuda_cache || s->cuda_cache_slot) return 0;
     di=cuda_cache_device_index(slot->device);
     s->g.cuda=slot->g; s->u.cuda=slot->u; s->d.cuda=slot->d;
     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=slot->device;
     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
     s->g.cuda_failed=s->u.cuda_failed=s->d.cuda_failed=0;
     s->cuda_cache=1; s->cuda_cache_bytes=slot->bytes; s->cuda_cache_used=++m->eclock;
+    s->cuda_cache_slot=slot;
     slot->owner=s;
     m->cuda_cache_bytes+=slot->bytes;
     if(di>=0) m->cuda_cache_by_device[di]+=slot->bytes;
+    return 1;
 }
 
 static int cuda_cache_init(Model *m){
@@ -1653,23 +1697,31 @@ static int cuda_cache_init(Model *m){
  * otherwise about to be copied across PCIe for this token.  ESlot ownership is
  * stable while it lives in pin[]/ecache[], so its three CUDA tensors can be
  * reused directly by the normal grouped-expert path. */
-static void cuda_cache_drop(Model *m, ESlot *s){
-    CudaCacheSlot *slot;
-    int di;
-    if(!s || !s->cuda_cache) return;
-    di=cuda_cache_device_index(s->g.cuda_device);
-    slot=cuda_cache_slot_for_entry(m,s);
-    if(slot) slot->owner=NULL;
+static void cuda_cache_entry_clear(ESlot *s){
     s->g.cuda=s->u.cuda=s->d.cuda=NULL;
     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
     s->g.cuda_failed=s->u.cuda_failed=s->d.cuda_failed=0;
-    if(di>=0){
-        m->cuda_cache_by_device[di]-=s->cuda_cache_bytes;
-        if(m->cuda_cache_by_device[di]<0) m->cuda_cache_by_device[di]=0;
-    }
-    m->cuda_cache_bytes-=s->cuda_cache_bytes;
-    if(m->cuda_cache_bytes<0) m->cuda_cache_bytes=0;
     s->cuda_cache=0; s->cuda_cache_bytes=0; s->cuda_cache_used=0;
+    s->cuda_cache_slot=NULL;
+}
+
+static int cuda_cache_drop(Model *m, ESlot *s){
+    CudaCacheSlot *slot;
+    int di;
+    if(!m||!s || (!s->cuda_cache&&!s->cuda_cache_slot)) return 0;
+    slot=cuda_cache_slot_for_entry(m,s);
+    if(!slot){
+        /* A copied/stale entry must never detach the real owner or debit its
+         * bytes.  Clear only the invalid local metadata. */
+        cuda_cache_entry_clear(s);
+        return 0;
+    }
+    di=cuda_cache_device_index(slot->device);
+    slot->owner=NULL;
+    if(di>=0) m->cuda_cache_by_device[di]-=slot->bytes;
+    m->cuda_cache_bytes-=slot->bytes;
+    cuda_cache_entry_clear(s);
+    return 1;
 }
 
 static CudaCacheSlot *cuda_cache_lru(Model *m){
@@ -1678,6 +1730,7 @@ static CudaCacheSlot *cuda_cache_lru(Model *m){
     for(int i=0;i<g_cuda_ndev;i++){
         CudaCacheArena *arena=&m->cuda_cache_arena[i];
         for(int z=0;z<arena->nslot;z++) if(arena->slot[z].owner &&
+           cuda_cache_slot_for_entry(m,arena->slot[z].owner)==&arena->slot[z] &&
            arena->slot[z].owner->cuda_cache_used<oldest){
             victim=&arena->slot[z];
             oldest=arena->slot[z].owner->cuda_cache_used;
@@ -1691,12 +1744,10 @@ static int cuda_cache_touch(Model *m, ESlot *s){
     int64_t need;
     if(!s || !m->cuda_cache_limit || !m->cuda_cache_slots || !s->slab) return 0;
     if(s->cuda_cache){
-        if(!cuda_cache_slot_for_entry(m,s)){
-            cuda_cache_drop(m,s);
-            m->cuda_cache_misses++;
-            return 0;
+        if(cuda_cache_slot_for_entry(m,s)){
+            m->cuda_cache_hits++; s->cuda_cache_used=++m->eclock; return 1;
         }
-        m->cuda_cache_hits++; s->cuda_cache_used=++m->eclock; return 1;
+        cuda_cache_drop(m,s);                    /* stale local metadata only */
     }
     need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
     if(need<=0 || need>m->cuda_cache_limit){ m->cuda_cache_misses++; return 0; }
@@ -1717,7 +1768,27 @@ static int cuda_cache_touch(Model *m, ESlot *s){
         m->cuda_cache_misses++; return 0;
     }
     m->cuda_cache_uploads++; m->cuda_cache_misses++;
-    cuda_cache_bind(m,s,slot);
+    return cuda_cache_bind(m,s,slot);
+}
+
+static int cuda_cache_validate(Model *m){
+    int64_t bytes=0, by_device[COLI_CUDA_MAX_DEVICES]={0};
+    int nslot=0;
+    if(!m) return 0;
+    for(int i=0;i<g_cuda_ndev;i++){
+        CudaCacheArena *arena=&m->cuda_cache_arena[i];
+        for(int z=0;z<arena->nslot;z++){
+            CudaCacheSlot *slot=&arena->slot[z]; int di;
+            nslot++;
+            if(!slot->owner) continue;
+            if(cuda_cache_slot_for_entry(m,slot->owner)!=slot) return 0;
+            di=cuda_cache_device_index(slot->device);
+            if(di<0) return 0;
+            bytes+=slot->bytes; by_device[di]+=slot->bytes;
+        }
+    }
+    if(nslot!=m->cuda_cache_slots || bytes!=m->cuda_cache_bytes || bytes>m->cuda_cache_limit) return 0;
+    for(int i=0;i<g_cuda_ndev;i++) if(by_device[i]!=m->cuda_cache_by_device[i]) return 0;
     return 1;
 }
 
@@ -1725,6 +1796,8 @@ static void cuda_cache_stats_print(Model *m){
     uint64_t fills=0,h2d_b=0; double h2d_ms=0;
     if(!m->cuda_cache_limit) return;
     coli_cuda_cache_stats(&fills,&h2d_b,&h2d_ms);
+    if(!cuda_cache_validate(m))
+        fprintf(stderr,"[CUDA] ERROR: streamed-expert cache ownership/accounting invariant failed\n");
     fprintf(stderr,"[CUDA] streamed-expert cache: %.2f/%.2f GB | %d slot%s | %llu hit, %llu miss, %llu fill, %llu evict | weight H2D %.2f MB (%.1f ms)\n",
         m->cuda_cache_bytes/1e9,m->cuda_cache_limit/1e9,
         m->cuda_cache_slots,m->cuda_cache_slots==1?"":"s",
@@ -2441,7 +2514,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
 #ifdef COLI_CUDA
-              if(dst->cuda_cache) cuda_cache_rebind(m,&m->ws[q],dst);
+              if(dst->cuda_cache && !cuda_cache_rebind(m,&m->ws[q],dst)){
+                  fprintf(stderr,"[CUDA] streamed-expert cache ownership lost during LRU promotion\n");
+                  exit(1);
+              }
 #endif
               dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
@@ -3179,7 +3255,7 @@ static void profile_print(Model *m, double elapsed){
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
  * replay the oracle sequence one token at a time. CPU and CUDA therefore see
- * identical hidden-state inputs even if their argmax predictions differ. */
+ * identical token inputs even if their hidden states or argmax predictions differ. */
 static void run_replay(Model *m, const int *full, int nfull, int np){
     if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
     kv_alloc(m,nfull+2);
@@ -3209,20 +3285,50 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #endif
 }
 
+static int replay_fixture_write(const char *path, const int *prompt, int np,
+                                const int *full, int nfull){
+    FILE *f;
+    if(!path||!*path) return 0;
+    f=fopen(path,"rb");
+    if(f){ fclose(f); fprintf(stderr,"REPLAY_OUT refuses to overwrite %s\n",path); return 0; }
+    f=fopen(path,"wb");
+    if(!f){ perror(path); return 0; }
+    fputs("{\"prompt_ids\":[",f);
+    for(int i=0;i<np;i++) fprintf(f,"%s%d",i?",":"",prompt[i]);
+    fputs("],\"full_ids\":[",f);
+    for(int i=0;i<nfull;i++) fprintf(f,"%s%d",i?",":"",full[i]);
+    fputs("]}\n",f);
+    if(fclose(f)){ perror(path); return 0; }
+    fprintf(stderr,"[REPLAY] saved fixed fixture: %s (%d prompt + %d decode tokens)\n",
+        path,np,nfull-np);
+    return 1;
+}
+
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
-    stops_arm(&m->c, eos);
+    const char *replay_out=getenv("REPLAY_OUT");
+    if(replay_out){
+        FILE *existing=fopen(replay_out,"rb");
+        if(existing){
+            fclose(existing); fprintf(stderr,"REPLAY_OUT refuses to overwrite %s\n",replay_out); exit(1);
+        }
+        if(g_temp!=0||g_draft!=0||getenv("GRAMMAR")){
+            fprintf(stderr,"REPLAY_OUT requires TEMP=0 DRAFT=0 and GRAMMAR unset\n"); exit(1);
+        }
+        g_nstop=0;                                  /* capture exactly NGEN tokens */
+    } else stops_arm(&m->c, eos);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }
-    printf("prompt: %d tokens | generating up to %d (EOS stop=%d) | n-gram draft=%d\n", np, ngen, eos, g_draft);
+    printf("prompt: %d tokens | generating up to %d (EOS stop=%d) | n-gram draft=%d\n",
+        np,ngen,replay_out?-1:eos,g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
@@ -3239,8 +3345,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     EmitStream es={&T,m,t,0,0};
     grammar_reset();
     double td=now_s();
-    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
+    int produced=spec_decode(m,all,np,ngen,replay_out?-1:eos,logit,emit_stream,&es,NULL);
     decode_s=now_s()-td;
+    if(replay_out && !replay_fixture_write(replay_out,pids,np,all,np+produced)) exit(1);
     double dt=prefill_s+decode_s;
     double tot=m->hits+m->miss;
     double decode_tot=(double)((m->hits-decode_hits0)+(m->miss-decode_miss0));
@@ -3544,6 +3651,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 }
 
 static void run_serve_mux(Model *m, const char *snap){
+#if defined(__APPLE__) || defined(__linux__)
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
@@ -3585,9 +3693,33 @@ static void run_serve_mux(Model *m, const char *snap){
     usage_save(m);
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+#else
+    /* SERVE_BATCH (continuous batching) uses select() on stdin, a Unix-ism.
+     * Not yet ported to native Windows — fall back to the single-sequence
+     * serve path (run_serve). Remove this stub once select()-free polling
+     * (e.g. WaitForSingleObject on the stdin handle) is implemented. */
+    (void)snap;
+    fprintf(stderr,"[SERVE_BATCH] continuous-batching serve is not yet available on "
+                   "native Windows; use the default serve path (omit SERVE_BATCH).\n");
+#endif
 }
 
 static void run_serve(Model *m, const char *snap){
+    /* Serve mode speaks a byte protocol over BOTH stdout and stdin:
+     *   stdout: \x01\x01READY\x01\x01\n, STAT lines, \x01\x01END\x01\x01\n
+     *   stdin:  text lines plus \x02RESET / \x02MORE control bytes.
+     * 'coli' matches the sentinels with endswith() and a "^STAT ..." regex,
+     * so they must arrive byte-exact (LF, no CR). On Windows the CRT opens
+     * both handles in TEXT mode: stdout translates '\n'->'\r\n' (so the READY
+     * sentinel never matches and chat hangs at ~10 GB resident), and stdin
+     * translates '\r\n'->'\n' and rejects writes of raw bytes with EINVAL,
+     * breaking the control protocol. Put BOTH handles in BINARY mode so the
+     * protocol bytes are exact in both directions. No-op on Linux/macOS. */
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");

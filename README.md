@@ -160,6 +160,12 @@ make iobench.exe        # disk I/O benchmark
 make test-c             # run C tests
 make test-python        # run Python tests (requires python)
 
+# AVX-VNNI: Intel Alder Lake+ (and Meteor Lake+) CPUs have a 128-bit int8
+# dot-product instruction (VPDPBUSD) the engine can use for ~1.3x faster
+# quantized matmul. The x86-64-v3 default (portable AVX2) compiles it out;
+# build for THIS machine to enable it:
+make glm.exe ARCH=native                       # banner prints "idot: avx-vnni"
+
 # Verify (tiny model, 2.4 MB):
 pip install torch transformers safetensors huggingface_hub
 python tools/make_glm_oracle.py                # generate tiny oracle
@@ -171,9 +177,50 @@ python coli chat --model D:\glm52_i4            # interactive chat
 python coli serve --model D:\glm52_i4            # OpenAI-compatible API
 ```
 
-**Status:** Phase 1 complete (compiles, correct, static-linked). O_DIRECT (Phase 2),
-GPU via `LoadLibrary` on `coli_cuda.dll` (Phases G0–G2), and full-model validation
-are separate workstreams. See `PORT_WINDOWS_PLAN.md` for the full plan.
+**Warmup (overnight cache priming):** the engine's expert cache learns from
+your workload. The included `warmup.ps1` script runs `coli run` in a loop with
+diverse prompts to build the `.coli_usage` histogram unattended, so the next
+real session starts with a large, accurate hot-expert pin. Each run saves usage
+atomically on clean completion.
+
+```powershell
+.\warmup.ps1 -Rounds 1 -Ngen 32               # ~60-90 min, durable progress
+```
+
+**NVIDIA GPU (optional, via runtime DLL):** on Windows the engine is built with
+MinGW gcc but CUDA kernels require MSVC + nvcc. The split is clean: build the
+CUDA backend into a standalone `coli_cuda.dll` (nvcc + MSVC), then the host
+`glm.exe` loads it at runtime via `LoadLibrary` (`c/backend_loader.c`). The host
+never links cudart directly; if the DLL is absent the engine falls back to CPU
+without error.
+
+```powershell
+# Prerequisites: CUDA Toolkit + MSVC Build Tools (cl.exe) + nvcc on PATH.
+# Build the DLL from a shell with the MSVC environment set (vcvars64.bat or
+# "x64 Native Tools Command Prompt for VS"):
+make cuda-dll CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" CUDA_ARCH=sm_120
+
+# Build the host with the runtime loader (CUDA_DLL=1 adds -DCOLI_CUDA and
+# links backend_loader.o instead of cudart):
+make glm.exe CUDA_DLL=1 ARCH=native
+
+# Run with the GPU expert tier (8 GB VRAM budget here; scale to your free VRAM):
+$env:COLI_CUDA="1"; $env:COLI_GPU="0"; $env:CUDA_EXPERT_GB="8"
+python coli chat --model D:\glm52_i4 --topp 0.7
+```
+
+The DLL exports the `extern "C"` CUDA API (`coli_cuda_init`, `coli_cuda_matmul`,
+etc.); `backend_loader.c` resolves every required symbol via `GetProcAddress` on
+first use.
+`ColiCudaTensor*` is opaque to the host (stored, never dereferenced), so the
+MSVC-allocated struct is safe across the ABI boundary. `CUDA_ARCH` must match
+your GPU's compute capability (e.g. `sm_120` for Blackwell / RTX 50-series,
+`sm_89` for Ada / RTX 40-series).
+
+**Status:** Phase 1 complete (compiles, correct, static-linked). The Windows
+GPU tier (runtime `coli_cuda.dll` via `LoadLibrary`) is implemented and
+verified on RTX 50-series (sm_120). O_DIRECT (Phase 2) and full-model
+validation against the transformers oracle remain separate workstreams.
 
 ### OpenAI-compatible API
 
@@ -368,6 +415,17 @@ python tools/benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 
 The fixture has random weights and is not a language model. It exists only to
 preserve the real MLA/MoE/streaming shapes and compare CPU streaming, dense-only
 CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
+
+For a real-model A/B, capture exact greedy token IDs once, then reuse the file:
+
+```bash
+PROMPT='your fixed prompt' NGEN=192 TEMP=0 DRAFT=0 \
+  REPLAY_OUT=replay.json SNAP=/nvme/glm52_i4 ./glm 64 4 4
+REF=replay.json REPLAY=1 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+```
+
+Capture ignores stop tokens so the continuation is exactly `NGEN` tokens and
+refuses to overwrite an existing fixture.
 
 ### Web interface
 
