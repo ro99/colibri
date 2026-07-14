@@ -21,7 +21,7 @@ instrumentation are acceptable when they enable a repeatable performance win or
 answer an important performance question.
 
 "Best tok/s at all costs" does **not** permit fabricated measurements, hidden
-quality changes, invalid comparisons, unsafe memory overcommit, silent fallback,
+quality changes, invalid comparisons, unsafe memory overcommit, silent fallback, further quantized weights (int4 is the minimum),
 data loss, or an unmaintainable Git history. Complexity must buy evidence.
 
 ## Repository authority
