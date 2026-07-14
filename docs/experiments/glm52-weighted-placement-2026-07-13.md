@@ -1,7 +1,9 @@
 # GLM-5.2 heterogeneous-GPU weighted placement experiment (2026-07-13)
 
-Status: A/B launched; result pending. This note must not be read as a performance
-claim until all six replay runs finish and the summary is inspected.
+Status: **failed / non-win**. The weighting mechanism reduced measured cache
+transfer time, but its 1.45% median end-to-end gain was smaller than run-to-run
+spread and one of three pairs regressed. The runtime implementation is retained
+on the failed experiment branch and is not merged into `main`.
 
 ## Hypothesis and acceptance contract
 
@@ -106,18 +108,54 @@ git diff --check                                     PASS
 
 The canonical tiny GLM oracle was unavailable because `c/glm_tiny` is absent;
 the repository's canonical `c/ref_glm.json` was not regenerated. The fixed
-real-model replay is the remaining smoke/correctness gate.
+real-model replay completed without fallback, invariant errors, or OOM.
 
-## Long A/B handoff
+## Real-model A/B result
 
-- tmux: `colibri-weighted-placement-ab`
-- attach: `tmux attach -t colibri-weighted-placement-ab`
-- summary: `c/bench/logs/weighted_placement_20260713_summary.txt`
-- raw logs: `c/bench/logs/bench_weighted_placement_20260713_{control,weighted}_rN.log.1`
-- GPU monitor: `c/bench/logs/weighted_placement_20260713_gpu.csv`
-- expected work: six full model loads/replays in AB/BA/AB order, then a parsed
-  summary with every tok/s, decode wall time, prefill time, cache traffic,
-  grouped rows, maximum RSS, median, and range.
+The matrix ran in AB/BA/AB order. Rates below are calculated from the unrounded
+192-token decode wall times, not the engine's two-decimal display.
 
-Decision remains **inconclusive** until the tmux job completes and its result is
-read.
+| Config | Rep | Prefill s | Decode s | Decode tok/s | Cache H2D ms | Routed rows | Max RSS GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| control | 1 | 12.266 | 224.299 | 0.8560 | 128199.5 | 65550 | 180.01 |
+| weighted | 1 | 12.070 | 212.123 | 0.9051 | 116276.0 | 65585 | 179.62 |
+| weighted | 2 | 10.927 | 212.126 | 0.9051 | 115349.5 | 65585 | 180.31 |
+| control | 2 | 12.059 | 215.201 | 0.8922 | 120070.5 | 65550 | 180.37 |
+| control | 3 | 12.297 | 213.606 | 0.8989 | 119658.2 | 65550 | 180.38 |
+| weighted | 3 | 12.087 | 214.286 | 0.8960 | 119000.8 | 65585 | 180.31 |
+
+- Control median: **0.8922 tok/s**; range 0.8560-0.8989.
+- Weighted median: **0.9051 tok/s**; range 0.8960-0.9051.
+- Median gain: **1.45%**; paired gains: +5.74%, +1.45%, -0.32%.
+- Median cache-weight H2D time: 120070.5 ms control versus 116276.0 ms
+  weighted (**-3.16%**).
+- Equal budget held: 422 cache slots / 7.98 GB occupied, 42.11 GB permanent
+  expert tier, and 59.25 GB total CUDA resident tensors in both configurations.
+- Weighted did slightly more work: 65,585 versus 65,550 routed rows and
+  464,409 versus 463,369 MB cache-weight H2D. This small difference penalizes
+  the candidate and does not explain its apparent gain.
+- Peak VRAM from the NVML monitor was 13,970 MiB on the 5060 Ti and
+  21,080/22,238 MiB on the 3090s. No error/fallback/OOM marker was present.
+
+Raw machine-local artifacts remain ignored under:
+
+- `c/bench/logs/weighted_placement_20260713_summary.txt`
+- `c/bench/logs/bench_weighted_placement_20260713_{control,weighted}_rN.log.1`
+- `c/bench/logs/weighted_placement_20260713_gpu.csv`
+
+A two-repetition variance follow-up was started because the apparent gain was
+below the control spread, then deliberately stopped before its first repetition
+completed: four more full model runs were not justified for a marginal policy
+whose effect was already below noise. Its partial logs are excluded.
+
+## Decision and next experiment
+
+Decision: **failed**. The expected transfer improvement appeared, but it did not
+produce a repeatable end-to-end win larger than noise, and the added placement
+policy is not justified by a possible ~1% effect. Do not merge the runtime code.
+
+Next, capture one sequential routing trace and simulate global LRU, per-layer
+LRU, and LFU offline at the same 422-slot budget. Only implement and benchmark a
+policy if the simulation projects a material miss/weight-H2D reduction (suggested
+gate: at least 10%), avoiding another expensive real-model matrix for a weak
+hypothesis.
