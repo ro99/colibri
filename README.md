@@ -32,7 +32,7 @@ The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No B
 - **MLA attention** (q/kv-LoRA, interleaved partial RoPE) with **compressed KV-cache**: 576 floats/token instead of 32,768 (57× smaller — GLM-5.2 has 64 heads and no GQA).
 - **DeepSeek-V3-style sigmoid router** (noaux_tc, routed_scaling_factor), shared expert, first-3-dense layers.
 - **Native MTP speculative decoding** — GLM-5.2's own multi-token-prediction head (layer 78) drafts tokens that the main model verifies in one batched forward. **The head must be int8** (the converter does this by default): at int4 draft acceptance collapses to 0–4% and speculation never engages; at int8 it's 39–59% acceptance, **2.2–2.8 tokens/forward** (community-measured, [#8](https://github.com/JustVugg/colibri/issues/8)). Lossless *in exact arithmetic* — but **not byte-identical to non-speculative greedy in practice** ([#100](https://github.com/JustVugg/colibri/issues/100)). This isn't MTP-specific: colibrì's quantized integer kernels are shape-dependent, so any batched (S>1) or GPU forward rounds slightly differently from the single-token path, and int4 GLM-5.2 sits close enough to argmax ties that such a rounding change can flip a token. MTP, the CUDA expert tier, and batched prefill are three different ways to trip the same sensitivity (community-confirmed in #100: swapping only the kernel family forks greedy output on 3/5 prompts, with **zero speculation**). Every emitted token is still the argmax of a *valid* forward — the continuation stays correct — it just isn't the same stream. For byte-exact reproducibility: `DRAFT=0` (no speculation), plus `IDOT=0 COLI_CUDA=0` if you also want kernel-family/GPU independence. Under sampling, rejection sampling keeps the distribution correct. Honest caveat from the same measurement: on a **cold** cache each verified draft routes to extra experts (~660 → ~1100 expert-loads/token), so speculation can be a net *time* loss until the cache/pin warms up.
-- **Grammar-forced speculative drafts** (`GRAMMAR=file.gbnf`, [#48](https://github.com/JustVugg/colibri/issues/48)) — on constrained-output workloads (JSON/NDJSON, function calling, structured extraction) the grammar itself is a third draft source: wherever it admits exactly **one** legal byte (braces, quotes, key names, enum bodies), that forced span is tokenized and injected as pre-accepted drafts with ~1.0 acceptance — no draft head, no lookup table, and it engages even with the int4 MTP head from [#8](https://github.com/JustVugg/colibri/issues/8). It never constrains sampling: forced spans are verified in the same batch-union forward as any draft, so a wrong or out-of-sync grammar cannot change the output — worst case is rejected drafts, and an adaptive guard turns the source off below 50% acceptance. Byte-level GBNF subset (literals, char classes, `| ( ) ? * +`, comments); `GRAMMAR_DRAFT=n` caps the forced span per forward (default 24). Composes with `DRAFT`/MTP, which fill the free-text gaps between forced spans.
+- **Grammar-forced speculative drafts** (`GRAMMAR=file.gbnf`, [#48](https://github.com/JustVugg/colibri/issues/48)) — on constrained-output workloads (JSON/NDJSON, function calling, structured extraction) the grammar itself is a third draft source: wherever it admits exactly **one** legal byte (braces, quotes, key names, enum bodies), that forced span is tokenized and injected as pre-accepted drafts with ~1.0 acceptance — no draft head, no lookup table, and it engages even with the int4 MTP head from [#8](https://github.com/JustVugg/colibri/issues/8). It never constrains sampling: forced spans are verified in the same batch-union forward as any draft, so a wrong or out-of-sync grammar cannot change the output — worst case is rejected drafts, and an adaptive guard turns the source off below 50% acceptance. Byte-level GBNF subset (literals, char classes, `| ( ) ? * +`, comments); `GRAMMAR_DRAFT=n` caps the forced span per forward (default 24). Composes with `DRAFT`/MTP, which fill the free-text gaps between forced spans. Full reference — mechanism, measured A/Bs, when it pays, prior art: [docs/grammar-draft.md](docs/grammar-draft.md).
 - **True sampling** — temperature + nucleus, defaults tuned for int4 reality (0.7 / 0.90; the official 1.0 / 0.95 samples quantization noise from the tail).
 - **Integer-dot kernels** (Q8_0-style int8 activations, AVX2 `maddubs`): int8 matmuls 1.4–2.5× faster (119 GFLOP/s measured), int4 1.8× in batch — routing decided per shape by measurement (int4 single-row stays f32: it measured slower).
 - **MLA weight absorption** (DeepSeek trick) for decode: no per-token k/v reconstruction — the query absorbs `kv_b`, context is projected after attention. Validated exact: TF 32/32 and generation 20/20 with absorption forced everywhere.
@@ -358,6 +358,9 @@ SNAP=/nvme/glm52_i4 ./glm 64 4 4
 # Reserve 8 GB of the 58 GB expert budget for RAM-expert reuse on a 3-GPU box.
 COLI_CUDA=1 COLI_GPUS=0,1,2 CUDA_EXPERT_GB=58 CUDA_EXPERT_CACHE_GB=8 \
 COLI_CUDA_STREAM_EXPERTS=1 CUDA_DENSE=1 PIN=stats.txt PIN_GB=180 RAM_GB=200 \
+# large-RAM host: fill safe VRAM, then keep every remaining expert in RAM
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=auto \
+CUDA_DENSE=1 COLI_CUDA_ATTN=1 PIN=stats.txt PIN_GB=all RAM_GB=auto \
 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
@@ -380,6 +383,25 @@ replay from 1.87 to 2.16 tok/s (+15.7%), reduced expert disk wait from 5.144s to
 3.948s, and kept the projected RAM peak below `RAM_GB=226`. The cache cap adjusts
 down automatically (54 to 40 in that run) so the larger pinned tier does not exceed
 the process budget. Start lower on hosts with less available RAM.
+
+`CUDA_EXPERT_GB=auto` fills each selected device only up to its measured free
+memory minus projected dense tensors and 2 GB of runtime headroom. `PIN_GB=all`
+then loads every remaining routed expert into RAM, eliminating decode-time disk
+misses when the host budget permits it. The regular `RAM_GB` guard still clamps
+the per-layer working cache and rejects unsafe projections; this mode is intended
+for dedicated high-memory inference hosts, not desktops running other workloads.
+On a dedicated 251 GiB host with six RTX 5090s, this mode selected a 176.7 GB
+VRAM expert tier and a 191.3 GB RAM tier (all 19,456 experts resident). The
+mode also adapts the VRAM tier every 16 emitted tokens by swapping hot RAM
+experts into existing GPU slots. A real 64-token greedy GLM-5.2 generation
+measured **6.00 tok/s decode**, up from
+2.20 tok/s end-to-end with the earlier 150 GB tier; expert hit rate was 100%
+and disk wait was zero. Prompt prefill is reported separately. This is a
+host-specific capacity result, not a portable default.
+
+Text-mode timing reports prefill separately from decode. The decode rate starts
+after the prompt KV is built, so it is comparable to `REPLAY` throughput without
+hiding time-to-first-token.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
 

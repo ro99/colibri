@@ -66,8 +66,18 @@ static DeviceContext *find_ctx(int device) {
     return nullptr;
 }
 
+/* cudaSetDevice on every call doubles expert-matmul time on 2 GPUs when the
+ * serial expert loop alternates devices (measured on RTX 5090 + 4090: 14.3s
+ * -> 25.4s per 32 tokens). The current device is per-thread in the CUDA
+ * runtime, so a thread-local cache skips the redundant switches. */
+static thread_local int g_current_device = -1;
+
 static int select_ctx(DeviceContext *ctx) {
-    return ctx && cuda_ok(cudaSetDevice(ctx->device), "select device");
+    if (!ctx) return 0;
+    if (g_current_device == ctx->device) return 1;
+    if (!cuda_ok(cudaSetDevice(ctx->device), "select device")) return 0;
+    g_current_device = ctx->device;
+    return 1;
 }
 
 __host__ __device__ static size_t row_bytes(int fmt, int I) {
@@ -579,6 +589,23 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     ctx->tensor_bytes += t->weight_bytes + (fmt ? (size_t)O * sizeof(float) : 0);
     *tensor = t;
     return 1;
+}
+
+extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
+                                          const void *weights,
+                                          const float *scales) {
+    if (!tensor || !weights || (tensor->fmt && !scales)) return 0;
+    DeviceContext *ctx=find_ctx(tensor->device);
+    if (!select_ctx(ctx)) return 0;
+    if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
+                            cudaMemcpyHostToDevice),"tensor refresh")) return 0;
+    if(tensor->fmt==2){
+        offset_to_signed_s4<<<(unsigned)((tensor->weight_bytes+255)/256),256>>>(
+            (uint8_t*)tensor->weights,tensor->weight_bytes);
+        if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
+    }
+    return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
+        (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
 }
 
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
